@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment (contains API keys)
+.env
+
+# ChromaDB persistent data (regenerated on reindex)
+agents/chromadb_data/
+
+# Agent output artifacts (generated per run)
+agents/output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
