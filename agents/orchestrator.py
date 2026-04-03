@@ -15,75 +15,43 @@ accurate context about what exists.
 import json
 import os
 import time
+import uuid
 from pathlib import Path
+from datetime import datetime
 
 from langchain_core.messages import SystemMessage, HumanMessage
 from rich import print as rprint
 from rich.panel import Panel
 
-from config import get_llm, LLM_COOLDOWN, RAG_RESULTS_K, RAG_MISTAKES_K, PROJECT_ROOT
+from config import get_llm, LLM_COOLDOWN, RAG_RESULTS_K, RAG_MISTAKES_K, PROJECT_ROOT, MAX_FIX_ROUNDS
 from state import AgentState
-from agents.agent_base import _invoke_with_retry
+from agents.agent_base import _invoke_with_retry, set_run_id, get_run_id
 
 
-SYSTEM_PROMPT = """You are the orchestrator of a multi-agent dev team called "Partners in Crime".
+SYSTEM_PROMPT = """You are the orchestrator of a multi-agent dev team. You create a plan and dispatch agents.
 
-Your agents and their EXACT responsibilities:
-- architect: Full-stack tech lead. Reads the project, designs the TECHNICAL SPEC (API contracts, data models, file structure, integration points). Writes a design doc that all other agents follow. USE THIS FIRST when 2+ agents are involved.
-- infra: Project setup and infrastructure. Creates package.json, tsconfig.json, config files, environment setup, Docker, CI/CD, installs dependencies with npm. ALWAYS include infra right after architect for new projects.
-- database: Database models, schemas, ORM setup, DB connection logic — works with whatever DB the project uses (MongoDB/Mongoose, PostgreSQL/Prisma, SQLAlchemy, etc.)
-- backend: API endpoints, business logic, authentication, server code — works with any framework (Next.js API routes, FastAPI, Express, etc.)
-- frontend: React/Vue/Svelte components, TypeScript, UI logic, client-side code, pages
-- uiux: Design specs, layouts, color tokens, component planning — BEFORE frontend builds
-- testing: Writing AND RUNNING tests for existing code. Uses whatever test framework the project needs (vitest, jest, pytest, etc.). Runs the tests and fixes failures until green.
+AGENTS: infra, architect, database, backend, frontend, uiux, testing
+- infra: scaffolds project (create-next-app, etc.), installs deps
+- architect: reads project + reference code, writes technical design doc
+- database: creates data models/schemas following the design doc
+- backend: creates API endpoints following the design doc
+- frontend: creates UI components/pages following the design doc
+- uiux: creates design specs (use BEFORE frontend if UI decisions needed)
+- testing: writes+runs tests, verifies build passes
 
-IMPORTANT CONTEXT: Each agent is AUTONOMOUS. They have tools to:
-- Read files in the project
-- Write/edit files in the project
-- Run shell commands (python, pytest, npm, npx, node, etc.)
-- Install packages (npm install, pip install)
-- They work on the REAL project directory, not a sandbox
+ROUTING:
+- NEW project (empty dir) → infra → architect → database → backend → frontend → testing
+- EXISTING project, multi-agent → architect → specialists → testing
+- Single-agent fix → just that agent
+- Always end with testing
 
-So your subtask descriptions should tell each agent WHAT to build, not HOW to use tools.
-They know how to use their tools. Focus on the business requirements and technical specs.
-
-ROUTING RULES:
-1. For a NEW project (empty or near-empty dir) → "infra" → "architect" → "database" → "backend" → "frontend" → "testing"
-   - INFRA FIRST: scaffolds the project (create-next-app, create-vite, etc.) so the directory has real configs
-   - ARCHITECT SECOND: reads the scaffolded project + any reference code, writes the technical spec
-   - Then specialists build on the real, working project base
-2. If a task needs 2+ specialist agents on an EXISTING project → start with "architect"
-3. If a task involves UI design decisions → "architect" → "uiux" → "frontend" → "testing"
-4. If a task needs data models + API → "architect" → "database" → "backend" → "testing"
-5. If a task is purely ONE agent's job (e.g., just fix a bug in one file) → skip architect
-6. If a task is about deployment/docker only → "infra"
-7. ALWAYS end with "testing" for any code changes — testing agent verifies the build works
-8. If unclear or you need more info → "human"
-
-RESPOND ONLY IN THIS JSON FORMAT:
-{
-  "plan": ["infra", "architect", "database", "backend", "frontend", "testing"],
-  "plan_details": {
-    "infra": "Scaffold Next.js project with create-next-app, install extra deps (mongoose, firebase-admin, etc.), create .env.example...",
-    "architect": "Read the scaffolded project and v1 reference code. Design the full technical spec...",
-    "database": "Follow the design doc. Create the database models/schemas...",
-    "backend": "Follow the design doc. Create the API endpoints...",
-    "frontend": "Follow the design doc. Create the React components and pages...",
-    "testing": "Write tests and RUN them. Fix any failures. Verify npm run build passes."
-  },
-  "reasoning": "New project: infra scaffolds first, architect designs on real structure, then specialists build"
-}
+RESPOND IN THIS EXACT JSON FORMAT ONLY:
+{"plan":["infra","architect","database","backend","frontend","testing"],"plan_details":{"infra":"what to do","architect":"what to do","database":"what to do","backend":"what to do","frontend":"what to do","testing":"what to do"},"reasoning":"why"}
 
 RULES:
-- "plan" lists ALL agents needed in execution order
-- For NEW projects, ALWAYS start with "infra" to scaffold, then "architect" to design
-- For EXISTING projects needing multi-agent work, start with "architect"
-- "plan_details" maps each agent name to its SPECIFIC subtask
-- For architect: tell it WHAT feature to design (it decides the technical details)
-- For specialists: tell them to FOLLOW the design doc AND what their piece is
-- For single-agent tasks (e.g. "fix this one bug"), skip architect — just send directly
-- If you need human input:
-  {"plan": ["human"], "plan_details": {"human": "your question"}, "reasoning": "..."}
+- plan_details: tell each agent WHAT to build (business requirements), not HOW
+- Each agent is autonomous with file read/write/run tools
+- If you need human input: {"plan":["human"],"plan_details":{"human":"your question"},"reasoning":"need info"}
 """
 
 _memory = None
@@ -170,6 +138,78 @@ def _get_project_structure(max_depth: int = 3) -> str:
     return "\n".join(lines) if file_count > 0 else "Project directory is empty (new project)"
 
 
+def _parse_test_report() -> dict:
+    """
+    Read docs/test-report.md and extract errors grouped by responsible agent.
+    Returns: {"backend": [errors...], "frontend": [errors...], "database": [errors...], "build_passed": bool}
+    """
+    import re
+
+    report_path = PROJECT_ROOT / "docs" / "test-report.md"
+    if not report_path.exists():
+        return {"build_passed": False, "raw": "No test report found"}
+
+    content = report_path.read_text(encoding="utf-8")
+
+    # Check if build passed
+    if "build status: pass" in content.lower():
+        return {"build_passed": True, "raw": content}
+
+    # Group errors by owner
+    errors_by_owner = {"backend": [], "frontend": [], "database": [], "infra": []}
+
+    # Parse structured error blocks
+    # Look for: **Owner:** backend (or frontend, database, infra)
+    current_error = []
+    current_owner = None
+
+    for line in content.split("\n"):
+        if line.startswith("### Error") or line.startswith("### error"):
+            # Save previous error
+            if current_error and current_owner:
+                errors_by_owner.setdefault(current_owner, []).append(
+                    "\n".join(current_error)
+                )
+            current_error = [line]
+            current_owner = None
+        elif "**owner:**" in line.lower() or "**Owner:**" in line:
+            owner_match = re.search(r'\*\*[Oo]wner:\*\*\s*(\w+)', line)
+            if owner_match:
+                current_owner = owner_match.group(1).lower()
+            current_error.append(line)
+        elif current_error:
+            current_error.append(line)
+
+    # Save last error
+    if current_error and current_owner:
+        errors_by_owner.setdefault(current_owner, []).append(
+            "\n".join(current_error)
+        )
+
+    # Fallback: if no structured errors found, try to classify by file paths
+    if not any(errors_by_owner.values()):
+        # Look for file paths in error lines
+        for line in content.split("\n"):
+            path_match = re.search(r'(src/[^\s:]+\.\w+)', line)
+            if path_match:
+                fpath = path_match.group(1)
+                if "/api/" in fpath or "/lib/" in fpath:
+                    errors_by_owner["backend"].append(line)
+                elif "/models/" in fpath:
+                    errors_by_owner["database"].append(line)
+                elif "/components/" in fpath or "/app/" in fpath:
+                    errors_by_owner["frontend"].append(line)
+
+    return {
+        "build_passed": False,
+        "backend": errors_by_owner.get("backend", []),
+        "frontend": errors_by_owner.get("frontend", []),
+        "database": errors_by_owner.get("database", []),
+        "infra": errors_by_owner.get("infra", []),
+        "raw": content,
+    }
+
+
 def orchestrator_node(state: AgentState) -> dict:
     """
     The orchestrator node runs in three modes:
@@ -227,12 +267,92 @@ def orchestrator_node(state: AgentState) -> dict:
                     "needs_human": False,
                 }
             else:
-                # Plan complete!
+                # ── Plan complete — check if we need fix loops ────
+                fix_round = state.get("_fix_round", 0)
+
+                # If testing just finished, check the report
+                if last_role == "testing" and fix_round < MAX_FIX_ROUNDS:
+                    report = _parse_test_report()
+
+                    if report.get("build_passed"):
+                        # Build is clean!
+                        rprint(Panel(
+                            f"[bold green]BUILD PASSED![/bold green] "
+                            f"All agents done, build clean after {fix_round} fix round(s).\n"
+                            f"[bold]Agents used:[/bold] {' -> '.join(plan)}\n"
+                            f"[bold]Files:[/bold] {len(all_files)} files",
+                            title="[green]Orchestrator — Build Clean[/green]",
+                        ))
+                        return {
+                            "next_agent": "END",
+                            "agent_plan": None,
+                            "_plan_details": None,
+                            "messages": [{"role": "orchestrator", "content": "Build passed — done"}],
+                            "needs_human": False,
+                        }
+
+                    # Build failed — route fixes to responsible agents
+                    new_fix_round = fix_round + 1
+                    fix_plan = []
+                    fix_details = {}
+
+                    for agent_name in ["database", "backend", "frontend", "infra"]:
+                        agent_errors = report.get(agent_name, [])
+                        if agent_errors:
+                            fix_plan.append(agent_name)
+                            error_text = "\n".join(agent_errors[:10])  # Cap at 10 errors
+                            fix_details[agent_name] = (
+                                f"FIX ROUND {new_fix_round}: The tester found build errors in YOUR files. "
+                                f"Read the test report at docs/test-report.md for full details.\n\n"
+                                f"YOUR ERRORS TO FIX:\n{error_text}\n\n"
+                                f"Steps:\n"
+                                f"1. Read docs/test-report.md for the full error report\n"
+                                f"2. Read the failing files\n"
+                                f"3. Fix the errors\n"
+                                f"4. Call task_done when fixed"
+                            )
+
+                    # Always end fix round with testing (retest)
+                    fix_plan.append("testing")
+                    fix_details["testing"] = (
+                        f"VERIFICATION ROUND {new_fix_round}: "
+                        f"Developers have attempted fixes. Re-run npm run build and "
+                        f"write a new test report to docs/test-report.md."
+                    )
+
+                    rprint(Panel(
+                        f"[bold yellow]FIX ROUND {new_fix_round}/{MAX_FIX_ROUNDS}[/bold yellow]\n"
+                        f"[bold]Bugs found by tester:[/bold]\n"
+                        + "\n".join(f"  {a}: {len(report.get(a, []))} error(s)" for a in ["backend", "frontend", "database", "infra"])
+                        + f"\n[bold]Fix plan:[/bold] {' -> '.join(fix_plan)}",
+                        title="[yellow]Orchestrator — Integration Fix Loop[/yellow]",
+                    ))
+
+                    first_agent = fix_plan[0]
+                    design_doc = _read_design_docs()
+
+                    return {
+                        "next_agent": first_agent,
+                        "agent_plan": fix_plan,
+                        "_plan_details": fix_details,
+                        "current_step": 0,
+                        "_fix_round": new_fix_round,
+                        "_test_report": report.get("raw", ""),
+                        "messages": [{"role": "orchestrator", "content": {
+                            "subtask": fix_details[first_agent],
+                            "reasoning": f"Fix round {new_fix_round}: routing bugs to {first_agent}",
+                            "files_from_previous": all_files,
+                            "design_doc": design_doc,
+                        }}],
+                        "needs_human": False,
+                    }
+
+                # No more fix rounds or testing didn't just run — done
                 rprint(Panel(
-                    f"[bold green]All {len(plan)} plan steps complete![/bold green]\n"
+                    f"[bold green]All plan steps complete![/bold green]\n"
                     f"[bold]Agents used:[/bold] {' -> '.join(plan)}\n"
-                    f"[bold]Files created/modified:[/bold]\n"
-                    + "\n".join(f"  - {f}" for f in all_files) if all_files else "  none",
+                    f"[bold]Fix rounds:[/bold] {fix_round}\n"
+                    f"[bold]Files:[/bold] {len(all_files)} total",
                     title="[green]Orchestrator — Plan Complete[/green]",
                 ))
                 return {
@@ -244,6 +364,12 @@ def orchestrator_node(state: AgentState) -> dict:
                 }
 
     # ── Mode 1: Fresh task — read project + call LLM to plan ─────
+    # Generate a unique run ID for this entire pipeline execution
+    if not get_run_id():
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:6]
+        set_run_id(run_id)
+        rprint(f"[dim]Pipeline run ID: {run_id}[/dim]")
+
     llm = get_llm("orchestrator")
 
     # Read the actual project structure

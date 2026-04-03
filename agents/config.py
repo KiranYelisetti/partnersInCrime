@@ -76,6 +76,22 @@ MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "3000"))
 BUILD_VERIFY_ENABLED = os.getenv("BUILD_VERIFY_ENABLED", "true").lower() == "true"
 BUILD_VERIFY_MAX_RETRIES = int(os.getenv("BUILD_VERIFY_MAX_RETRIES", "2"))
 
+# Wall-clock timeout per agent (seconds). Kills agent if it exceeds this,
+# regardless of iteration count. Prevents runaway agents.
+AGENT_TIMEOUT_SECONDS = int(os.getenv("AGENT_TIMEOUT_SECONDS", "600"))  # 10 min default
+
+# Cycle detection: if an agent calls the same tool with the same args
+# this many times in a row, force-stop it. Catches infinite loops.
+MAX_IDENTICAL_TOOL_CALLS = int(os.getenv("MAX_IDENTICAL_TOOL_CALLS", "3"))
+
+# Integration fix loop: after all agents build, tester reports bugs.
+# Orchestrator routes fixes back to responsible agents, then retests.
+# This repeats up to MAX_FIX_ROUNDS times.
+MAX_FIX_ROUNDS = int(os.getenv("MAX_FIX_ROUNDS", "3"))
+
+# Logging: per-agent structured logs for audit trail
+AGENT_LOG_DIR = Path(os.getenv("AGENT_LOG_DIR", str(Path(__file__).parent / "logs")))
+
 # Reference project: agents can read files from this path (read-only)
 # to understand the v1 codebase when building v2.
 _ref_root = os.getenv("REFERENCE_PROJECT_ROOT", "")
@@ -114,8 +130,6 @@ def get_llm(role: str = "specialist"):
         from langchain_ollama import ChatOllama
 
         ctx = NUM_CTX
-        if role == "orchestrator":
-            ctx = min(NUM_CTX, 8192)
 
         return ChatOllama(
             model=model,

@@ -15,6 +15,9 @@ agents/chromadb_data/
 # Agent output artifacts (generated per run)
 agents/output/
 
+# Agent execution logs (generated per run)
+agents/logs/
+
 # IDE
 .vscode/
 .idea/

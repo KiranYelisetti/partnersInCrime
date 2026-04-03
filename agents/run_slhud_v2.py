@@ -71,6 +71,8 @@ try:
         "current_step":  0,
         "_plan_details": None,
         "files_changed": [],
+        "_fix_round": 0,
+        "_test_report": None,
     })
 
     elapsed = time.time() - start

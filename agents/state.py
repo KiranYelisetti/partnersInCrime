@@ -40,3 +40,7 @@ class AgentState(TypedDict):
 
     # Files created/modified by agents — passed to next agent for context
     files_changed: Annotated[List[str], add]
+
+    # Integration fix loop: tester files bugs, orchestrator routes to devs
+    _fix_round: int           # Current fix iteration (0 = first build, 1+ = fix rounds)
+    _test_report: Optional[str]  # Structured bug report from testing agent

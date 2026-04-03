@@ -19,8 +19,11 @@ RUN code, SEE errors, and FIX them autonomously.
 """
 import json
 import time
+import uuid
+import hashlib
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+from datetime import datetime, timezone
 
 from langchain_core.messages import (
     SystemMessage, HumanMessage, AIMessage, ToolMessage,
@@ -33,8 +36,129 @@ from config import (
     get_llm, LLM_COOLDOWN, MAX_TOOL_ITERATIONS,
     MAX_TOOL_RESULT_CHARS, PROJECT_ROOT,
     BUILD_VERIFY_ENABLED, BUILD_VERIFY_MAX_RETRIES,
+    AGENT_TIMEOUT_SECONDS, MAX_IDENTICAL_TOOL_CALLS, AGENT_LOG_DIR,
 )
 from state import AgentState
+
+
+# ── Run ID: unique per pipeline invocation ───────────────────────
+# Set once at import, reset by orchestrator at pipeline start.
+_current_run_id: str = ""
+
+
+def set_run_id(run_id: str):
+    global _current_run_id
+    _current_run_id = run_id
+
+
+def get_run_id() -> str:
+    return _current_run_id
+
+
+# ── Agent Logger: per-agent structured audit trail ───────────────
+
+class AgentLogger:
+    """Writes structured JSONL logs per agent per run for full traceability."""
+
+    def __init__(self, run_id: str, agent_name: str, task_id: str):
+        self.run_id = run_id
+        self.agent_name = agent_name
+        self.task_id = task_id
+        self._log_dir = AGENT_LOG_DIR / run_id
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._log_file = self._log_dir / f"{agent_name}.jsonl"
+        self._start_time = time.time()
+        self.log("agent_start", {"task_id": task_id})
+
+    def log(self, event: str, data: dict = None):
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "elapsed_s": round(time.time() - self._start_time, 2),
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "agent": self.agent_name,
+            "event": event,
+            **(data or {}),
+        }
+        try:
+            with open(self._log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, default=str) + "\n")
+        except Exception:
+            pass  # Logging should never crash the agent
+
+    def log_tool_call(self, iteration: int, tool_name: str, tool_args: dict, result: str, duration_s: float):
+        self.log("tool_call", {
+            "iteration": iteration,
+            "tool": tool_name,
+            "args_summary": _summarize_args(tool_args, max_len=200),
+            "result_preview": (result or "")[:200],
+            "duration_s": round(duration_s, 2),
+        })
+
+    def log_completion(self, success: bool, iterations: int, files: list, summary: str):
+        self.log("agent_done", {
+            "success": success,
+            "iterations": iterations,
+            "files_changed": files,
+            "summary": summary[:300],
+            "total_time_s": round(time.time() - self._start_time, 2),
+        })
+
+
+# ── Cycle Detector: catches repetitive tool call loops ───────────
+
+class CycleDetector:
+    """Tracks consecutive identical tool calls and detects loops."""
+
+    def __init__(self, max_identical: int = MAX_IDENTICAL_TOOL_CALLS):
+        self.max_identical = max_identical
+        self._last_signature = ""
+        self._consecutive_count = 0
+        self._all_signatures: Dict[str, int] = {}  # signature -> count
+
+    def _make_signature(self, tool_name: str, tool_args: dict) -> str:
+        """Create a hashable signature from tool name + args."""
+        args_str = json.dumps(tool_args, sort_keys=True, default=str)
+        return hashlib.md5(f"{tool_name}:{args_str}".encode()).hexdigest()
+
+    def check(self, tool_name: str, tool_args: dict) -> Optional[str]:
+        """
+        Record a tool call and check for cycles.
+        Returns an error message if cycle detected, None otherwise.
+        """
+        sig = self._make_signature(tool_name, tool_args)
+
+        # Track global frequency
+        self._all_signatures[sig] = self._all_signatures.get(sig, 0) + 1
+
+        # Track consecutive identical calls
+        if sig == self._last_signature:
+            self._consecutive_count += 1
+        else:
+            self._last_signature = sig
+            self._consecutive_count = 1
+
+        if self._consecutive_count >= self.max_identical:
+            return (
+                f"CYCLE DETECTED: You called `{tool_name}` with the same arguments "
+                f"{self._consecutive_count} times in a row. You are stuck in a loop. "
+                f"STOP repeating this action. Try a DIFFERENT approach or call task_done "
+                f"if you cannot proceed."
+            )
+
+        # Also catch non-consecutive repeats (same call 5+ times total)
+        if self._all_signatures[sig] >= self.max_identical + 2:
+            return (
+                f"REPETITION WARNING: You have called `{tool_name}` with identical "
+                f"arguments {self._all_signatures[sig]} times total during this task. "
+                f"This suggests you are not making progress. Try a different approach."
+            )
+
+        return None
+
+    def reset(self):
+        self._last_signature = ""
+        self._consecutive_count = 0
 
 
 # ── The "done" sentinel tool ──────────────────────────────────────
@@ -80,6 +204,19 @@ def _invoke_with_retry(llm, messages, max_attempts=3, cooldown=None):
             return llm.invoke(messages)
         except Exception as e:
             error_str = str(e).lower()
+
+            # Non-retryable errors — fail immediately
+            is_fatal = any(phrase in error_str for phrase in [
+                "credit balance is too low",
+                "invalid api key",
+                "invalid x-api-key",
+                "authentication_error",
+                "permission_error",
+                "not_found_error",
+            ])
+            if is_fatal:
+                rprint(f"  [red]Fatal API error (not retryable): {str(e)[:200]}[/red]")
+                raise
 
             # Ollama transient errors
             ollama_transient = any(phrase in error_str for phrase in [
@@ -709,6 +846,10 @@ def run_agent_loop(
 
     llm = get_llm("specialist")
 
+    # ── Generate unique task ID for this agent run ────────────────
+    task_id = str(uuid.uuid4())[:8]
+    run_id = get_run_id() or "no_run"
+
     # Build tool set: agent's tools + the task_done sentinel
     all_tools = list(tools) + [task_done]
     tool_map = {t.name: t for t in all_tools}
@@ -724,6 +865,11 @@ def run_agent_loop(
         design_doc = last_msg["content"].get("design_doc", "")
     else:
         subtask = state.get("task", "No task provided")
+
+    # ── Initialize stability systems ──────────────────────────────
+    logger = AgentLogger(run_id, agent_name, task_id)
+    cycle_detector = CycleDetector()
+    agent_start_time = time.time()
 
     # Gather files produced by previous agents in this plan
     prev_files = state.get("files_changed", [])
@@ -782,7 +928,8 @@ def run_agent_loop(
     task_prompt = "\n".join(prompt_parts)
 
     rprint(Panel(
-        f"[bold]Task:[/bold] {subtask[:300]}",
+        f"[bold]Task:[/bold] {subtask[:300]}\n"
+        f"[dim]run={run_id} task={task_id} timeout={AGENT_TIMEOUT_SECONDS}s[/dim]",
         title=f"[cyan]{agent_name.upper()} Agent[/cyan]",
         subtitle="Starting autonomous execution",
     ))
@@ -804,6 +951,16 @@ def run_agent_loop(
     consecutive_nudges = 0  # Track repeated text-only responses
 
     for iteration in range(MAX_TOOL_ITERATIONS):
+        # ── Wall-clock timeout check ─────────────────────────────
+        elapsed = time.time() - agent_start_time
+        if elapsed > AGENT_TIMEOUT_SECONDS:
+            rprint(f"  [red]TIMEOUT: {agent_name} exceeded {AGENT_TIMEOUT_SECONDS}s "
+                   f"({elapsed:.0f}s elapsed) — force stopping[/red]")
+            logger.log("timeout", {"elapsed_s": round(elapsed, 2), "iteration": iteration})
+            final_output = (f"Agent {agent_name} timed out after {elapsed:.0f}s "
+                          f"at iteration {iteration}")
+            break
+
         # ── Compress context if getting long ──────────────────────
         if iteration > 0 and iteration % _COMPRESS_EVERY == 0:
             messages = _compress_messages(messages)
@@ -813,6 +970,7 @@ def run_agent_loop(
             response = _invoke_with_retry(llm_with_tools, messages)
         except Exception as e:
             rprint(f"  [red]LLM call failed at step {iteration + 1}: {e}[/red]")
+            logger.log("llm_error", {"error": str(e)[:300], "iteration": iteration})
             final_output = f"Agent {agent_name} LLM error: {e}"
             break
 
@@ -889,6 +1047,27 @@ def run_agent_loop(
             rprint(f"  [dim]Step {iteration + 1}: "
                    f"{tool_name}({_summarize_args(tool_args)})[/dim]")
 
+            # ── Cycle detection ──────────────────────────────────
+            if tool_name != "task_done":
+                cycle_msg = cycle_detector.check(tool_name, tool_args)
+                if cycle_msg:
+                    rprint(f"  [yellow]{cycle_msg[:120]}[/yellow]")
+                    logger.log("cycle_detected", {
+                        "tool": tool_name, "iteration": iteration,
+                        "consecutive": cycle_detector._consecutive_count,
+                    })
+                    messages.append(ToolMessage(
+                        content=cycle_msg,
+                        tool_call_id=tool_id,
+                    ))
+                    # Give agent one more chance, then force stop
+                    if cycle_detector._consecutive_count >= MAX_IDENTICAL_TOOL_CALLS + 1:
+                        rprint(f"  [red]Cycle not broken after warning — "
+                               f"force stopping {agent_name}[/red]")
+                        final_output = f"Agent {agent_name} terminated: stuck in cycle"
+                        done_this_round = True
+                    break
+
             # Handle task_done — agent signals completion
             if tool_name == "task_done":
                 try:
@@ -937,7 +1116,8 @@ def run_agent_loop(
                     break
 
                 # ── Build verification ────────────────────────────
-                if BUILD_VERIFY_ENABLED and build_retries < BUILD_VERIFY_MAX_RETRIES:
+                # Skip for testing agent — it IS the build verifier
+                if BUILD_VERIFY_ENABLED and agent_name != "testing" and build_retries < BUILD_VERIFY_MAX_RETRIES:
                     build_cmds = _detect_build_commands()
                     if build_cmds:
                         rprint(f"  [dim]Running build check: {', '.join(build_cmds)}[/dim]")
@@ -969,6 +1149,7 @@ def run_agent_loop(
                 break
 
             # Execute the tool
+            tool_start = time.time()
             if tool_name in tool_map:
                 try:
                     result = tool_map[tool_name].invoke(tool_args)
@@ -986,6 +1167,8 @@ def run_agent_loop(
                     f"Error: Unknown tool '{tool_name}'. "
                     f"Available tools: {', '.join(tool_map.keys())}"
                 )
+            tool_duration = time.time() - tool_start
+            logger.log_tool_call(iteration, tool_name, tool_args, str(result), tool_duration)
 
             # Feed result back to LLM (truncated to save context)
             messages.append(ToolMessage(
@@ -1052,9 +1235,14 @@ def run_agent_loop(
         except Exception:
             pass
 
+    # ── Log completion ──────────────────────────────────────────
+    logger.log_completion(success, iteration + 1, files_changed, final_output)
+
+    total_time = time.time() - agent_start_time
     rprint(Panel(
         f"[bold green]Done[/bold green] — {iteration + 1} steps, "
-        f"{len(files_changed)} files touched\n"
+        f"{len(files_changed)} files touched, {total_time:.1f}s\n"
+        f"[dim]run={run_id} task={task_id}[/dim]\n"
         f"[bold]Files:[/bold] {', '.join(files_changed) if files_changed else 'none'}\n"
         f"[bold]Summary:[/bold] {final_output[:300]}",
         title=f"[cyan]{agent_name.upper()} Agent — Complete[/cyan]",
