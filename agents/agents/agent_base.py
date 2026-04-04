@@ -337,7 +337,14 @@ def _detect_project_framework() -> str:
             "}\n"
             "```\n\n"
             "**Client components** that use hooks (useState, useEffect) MUST have "
-            "`'use client'` as the first line.\n\n"
+            "the string `\"use client\";` (WITH QUOTES) as the VERY FIRST LINE of the file. "
+            "Example:\n"
+            "```typescript\n"
+            "\"use client\";\n"
+            "import { useState } from 'react';\n"
+            "```\n"
+            "WRONG: `use client` (no quotes), `/* use client */` (comment), `'use client'` at line 2+.\n"
+            "The directive MUST be a quoted string on line 1.\n\n"
             "**DO NOT use Express patterns** (no `import express`, no `Request/Response` "
             "from express, no `app.get()`). Use Next.js `NextRequest`/`NextResponse`.\n\n"
             "**TypeScript:** Write ALL code as .ts/.tsx files with import/export syntax."
@@ -871,6 +878,10 @@ def run_agent_loop(
     cycle_detector = CycleDetector()
     agent_start_time = time.time()
 
+    # Set agent context for tool hooks (write scoping, validation)
+    from tools.hooks import set_current_agent
+    set_current_agent(agent_name)
+
     # Gather files produced by previous agents in this plan
     prev_files = state.get("files_changed", [])
 
@@ -1154,11 +1165,19 @@ def run_agent_loop(
                 try:
                     result = tool_map[tool_name].invoke(tool_args)
 
-                    # Track file-modifying operations
+                    # Track file-modifying operations (only successful ones)
                     if tool_name in ("write_file", "edit_file", "append_file"):
-                        path = tool_args.get("path", "")
-                        if path and path not in files_changed:
-                            files_changed.append(path)
+                        result_str = str(result)
+                        was_blocked = (
+                            result_str.startswith("WRITE BLOCKED:")
+                            or result_str.startswith("VALIDATION ERROR:")
+                            or result_str.startswith("VALIDATION WARNING:")
+                            or result_str.startswith("Error:")
+                        )
+                        if not was_blocked:
+                            path = tool_args.get("path", "")
+                            if path and path not in files_changed:
+                                files_changed.append(path)
 
                 except Exception as e:
                     result = f"Tool execution error: {e}"
@@ -1171,10 +1190,38 @@ def run_agent_loop(
             logger.log_tool_call(iteration, tool_name, tool_args, str(result), tool_duration)
 
             # Feed result back to LLM (truncated to save context)
+            result_text = _truncate(str(result))
             messages.append(ToolMessage(
-                content=_truncate(str(result)),
+                content=result_text,
                 tool_call_id=tool_id,
             ))
+
+            # ── Write-blocked correction ─────────────────────────
+            # When an agent is blocked from writing, inject a firm
+            # reminder so it stops retrying and does its actual job.
+            if str(result).startswith("WRITE BLOCKED:"):
+                from definitions.loader import get_agent_config
+                try:
+                    cfg = get_agent_config(agent_name)
+                    allowed = cfg.get("write_scopes", [])
+                except Exception:
+                    allowed = []
+                correction = (
+                    f"IMPORTANT: You are the {agent_name} agent. You can ONLY write to: "
+                    f"{allowed if allowed else '(unrestricted)'}. "
+                    f"Do NOT attempt to write outside your scope again. "
+                )
+                if agent_name == "testing":
+                    correction += (
+                        "Your job is to REPORT bugs, not fix code. "
+                        "Write your findings to docs/test-report.md and call task_done."
+                    )
+                else:
+                    correction += (
+                        "If you need a file created outside your scope, mention it in "
+                        "your task_done summary so the responsible agent can do it."
+                    )
+                messages.append(HumanMessage(content=correction))
 
         if done_this_round:
             break

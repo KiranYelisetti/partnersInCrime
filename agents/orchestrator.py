@@ -141,71 +141,90 @@ def _get_project_structure(max_depth: int = 3) -> str:
 def _parse_test_report() -> dict:
     """
     Read docs/test-report.md and extract errors grouped by responsible agent.
-    Returns: {"backend": [errors...], "frontend": [errors...], "database": [errors...], "build_passed": bool}
+    Returns: {"backend": [errors...], "frontend": [errors...], "database": [errors...],
+              "infra": [errors...], "build_passed": bool, "raw": str}
+
+    Handles multiple report formats from different models:
+      - "### Error N" blocks with "**Owner:** backend"
+      - Numbered lists "1." with "**Owner**: Frontend" (colon outside bold)
+      - Plain file-path mentions as fallback
     """
     import re
 
     report_path = PROJECT_ROOT / "docs" / "test-report.md"
     if not report_path.exists():
-        return {"build_passed": False, "raw": "No test report found"}
+        return {"build_passed": False, "raw": "No test report found",
+                "backend": [], "frontend": [], "database": [], "infra": []}
 
     content = report_path.read_text(encoding="utf-8")
 
     # Check if build passed
     if "build status: pass" in content.lower():
-        return {"build_passed": True, "raw": content}
+        return {"build_passed": True, "raw": content,
+                "backend": [], "frontend": [], "database": [], "infra": []}
 
-    # Group errors by owner
     errors_by_owner = {"backend": [], "frontend": [], "database": [], "infra": []}
 
-    # Parse structured error blocks
-    # Look for: **Owner:** backend (or frontend, database, infra)
-    current_error = []
-    current_owner = None
+    # ── Strategy 1: Find Owner tags in any format ────────────────
+    # Matches: **Owner:** backend, **Owner**: Frontend, **owner**: BACKEND, etc.
+    owner_pattern = re.compile(
+        r'\*\*[Oo]wner\*?\*?[:\s]*[:\s]*(\w+)', re.IGNORECASE
+    )
 
-    for line in content.split("\n"):
-        if line.startswith("### Error") or line.startswith("### error"):
-            # Save previous error
-            if current_error and current_owner:
-                errors_by_owner.setdefault(current_owner, []).append(
-                    "\n".join(current_error)
-                )
-            current_error = [line]
-            current_owner = None
-        elif "**owner:**" in line.lower() or "**Owner:**" in line:
-            owner_match = re.search(r'\*\*[Oo]wner:\*\*\s*(\w+)', line)
-            if owner_match:
-                current_owner = owner_match.group(1).lower()
-            current_error.append(line)
-        elif current_error:
-            current_error.append(line)
+    # Split into error blocks — separated by "### Error", numbered "1.", "2.",
+    # or "- **File**:" at the start of a line
+    block_pattern = re.compile(
+        r'^(?:###\s*[Ee]rror|\d+\.\s+\*\*[Ff]ile|- \*\*[Ff]ile)', re.MULTILINE
+    )
+    splits = block_pattern.split(content)
+    boundaries = list(block_pattern.finditer(content))
 
-    # Save last error
-    if current_error and current_owner:
-        errors_by_owner.setdefault(current_owner, []).append(
-            "\n".join(current_error)
-        )
+    for i, boundary in enumerate(boundaries):
+        block_start = boundary.start()
+        block_end = boundaries[i + 1].start() if i + 1 < len(boundaries) else len(content)
+        block_text = content[block_start:block_end].strip()
 
-    # Fallback: if no structured errors found, try to classify by file paths
+        # Find owner in this block
+        owner_match = owner_pattern.search(block_text)
+        if owner_match:
+            owner = owner_match.group(1).lower()
+            if owner in errors_by_owner:
+                errors_by_owner[owner].append(block_text)
+
+    # ── Strategy 2: Fallback — classify by file paths in error lines ─
     if not any(errors_by_owner.values()):
-        # Look for file paths in error lines
         for line in content.split("\n"):
-            path_match = re.search(r'(src/[^\s:]+\.\w+)', line)
-            if path_match:
-                fpath = path_match.group(1)
-                if "/api/" in fpath or "/lib/" in fpath:
-                    errors_by_owner["backend"].append(line)
-                elif "/models/" in fpath:
-                    errors_by_owner["database"].append(line)
-                elif "/components/" in fpath or "/app/" in fpath:
-                    errors_by_owner["frontend"].append(line)
+            # Look for src/ file paths
+            path_match = re.search(r'(src/[^\s:,\)]+\.\w+)', line)
+            if not path_match:
+                continue
+            fpath = path_match.group(1)
+            # Order matters: /app/api/ must be checked before /app/
+            if "/app/api/" in fpath or "/lib/" in fpath or "/middleware/" in fpath or "/services/" in fpath:
+                errors_by_owner["backend"].append(line.strip())
+            elif "/models/" in fpath or "/db/" in fpath:
+                errors_by_owner["database"].append(line.strip())
+            elif "/components/" in fpath or "/hooks/" in fpath or "/pages/" in fpath:
+                errors_by_owner["frontend"].append(line.strip())
+            elif "/app/" in fpath:
+                # /app/ pages (not /app/api/) are frontend
+                errors_by_owner["frontend"].append(line.strip())
+
+    # ── Strategy 3: Last resort — if build failed but no errors classified,
+    # the report is unstructured. Assign everything to frontend (most common
+    # build errors are missing 'use client', bad imports, etc.)
+    if not any(errors_by_owner.values()) and "fail" in content.lower():
+        errors_by_owner["frontend"].append(
+            "Build failed but errors could not be classified. "
+            "Read docs/test-report.md for details and fix all errors in your files."
+        )
 
     return {
         "build_passed": False,
-        "backend": errors_by_owner.get("backend", []),
-        "frontend": errors_by_owner.get("frontend", []),
-        "database": errors_by_owner.get("database", []),
-        "infra": errors_by_owner.get("infra", []),
+        "backend": errors_by_owner["backend"],
+        "frontend": errors_by_owner["frontend"],
+        "database": errors_by_owner["database"],
+        "infra": errors_by_owner["infra"],
         "raw": content,
     }
 

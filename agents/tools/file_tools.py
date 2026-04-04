@@ -78,8 +78,16 @@ def write_file(path: str, content: Any) -> str:
     """Write content to a file. Creates parent directories if needed. Overwrites existing files.
     Content can be a string or a JSON object (dict/list) — JSON objects are auto-serialized."""
     import json as _json
+    from tools.hooks import get_current_agent, check_write_scope, validate_content
 
     resolved = _safe_path(path)
+
+    # ── Agent write scope check ──────────────────────────────────
+    agent = get_current_agent()
+    if agent:
+        scope_error = check_write_scope(agent, path)
+        if scope_error:
+            return scope_error
 
     # Block full overwrites of scaffolded config files
     if resolved.exists() and resolved.name in _PROTECTED_FILES:
@@ -107,6 +115,11 @@ def write_file(path: str, content: Any) -> str:
             )
     elif not isinstance(content, str):
         content = str(content)
+
+    # ── Pre-write validation hooks ───────────────────────────────
+    validation_error = validate_content(path, content)
+    if validation_error:
+        return validation_error
 
     resolved.write_text(content, encoding="utf-8")
     lines = content.count("\n") + 1
@@ -218,7 +231,17 @@ def edit_file(path: str, old_content: str, new_content: str) -> str:
         old_content: The exact text to find and replace (must match exactly, including whitespace)
         new_content: The replacement text
     """
+    from tools.hooks import get_current_agent, check_write_scope
+
     resolved = _safe_path(path)
+
+    # ── Agent write scope check ──────────────────────────────────
+    agent = get_current_agent()
+    if agent:
+        scope_error = check_write_scope(agent, path)
+        if scope_error:
+            return scope_error
+
     if not resolved.exists():
         return f"Error: File not found: {resolved}"
     if not resolved.is_file():
@@ -239,6 +262,13 @@ def edit_file(path: str, old_content: str, new_content: str) -> str:
         )
 
     new_text = text.replace(old_content, new_content, 1)
+
+    # ── Validate the resulting file content ──────────────────────
+    from tools.hooks import validate_content
+    validation_error = validate_content(path, new_text)
+    if validation_error:
+        return validation_error
+
     resolved.write_text(new_text, encoding="utf-8")
 
     old_lines = old_content.count("\n") + 1
@@ -249,7 +279,17 @@ def edit_file(path: str, old_content: str, new_content: str) -> str:
 @tool
 def create_directory(path: str) -> str:
     """Create a directory (and any parent directories)."""
+    from tools.hooks import get_current_agent, check_write_scope
+
     resolved = _safe_path(path)
+
+    # Agent write scope check (directory creation = implicit write)
+    agent = get_current_agent()
+    if agent:
+        scope_error = check_write_scope(agent, path + "/")
+        if scope_error:
+            return scope_error
+
     resolved.mkdir(parents=True, exist_ok=True)
     return f"Created directory: {resolved}"
 
