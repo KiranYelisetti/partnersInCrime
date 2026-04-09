@@ -68,8 +68,22 @@ def check_write_scope(agent_name: str, file_path: str) -> Optional[str]:
 
     rel = rel.replace("\\", "/")  # Normalize Windows paths
 
-    # Check if any scope prefix matches
-    for scope in scopes:
+    # Separate exclusion patterns (prefixed with "!") from inclusions
+    excludes = [s[1:] for s in scopes if s.startswith("!")]
+    includes = [s for s in scopes if not s.startswith("!")]
+
+    # Check exclusions first — if any exclusion matches, block the write
+    for exc in excludes:
+        if rel.startswith(exc) or rel == exc.rstrip("/"):
+            allowed = ", ".join(includes)
+            return (
+                f"WRITE BLOCKED: Agent '{agent_name}' is excluded from writing to '{rel}'. "
+                f"Your allowed paths: [{allowed}] (excludes: {excludes}). "
+                f"This file belongs to another agent. Focus on YOUR task only."
+            )
+
+    # Check if any inclusion prefix matches
+    for scope in includes:
         if rel.startswith(scope) or rel == scope.rstrip("/"):
             return None
 
@@ -160,8 +174,10 @@ def validate_content(file_path: str, content: str) -> Optional[str]:
                 )
 
     # ── Warn on suspiciously small overwrites ─────────────────────
+    # Exempt ephemeral report files — these are rewritten every pipeline run.
+    _OVERWRITE_EXEMPT = {"review-report.md", "test-report.md"}
     resolved = PROJECT_ROOT / p if not p.is_absolute() else p
-    if resolved.exists():
+    if resolved.exists() and p.name not in _OVERWRITE_EXEMPT:
         existing_size = resolved.stat().st_size
         new_size = len(content.encode("utf-8"))
         # If new content is less than 20% of existing and existing is substantial

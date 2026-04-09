@@ -361,6 +361,7 @@ frontend:
   tools: ALL_TOOLS
   write_scopes:
     - "src/app/"
+    - "!src/app/api/"           # API routes belong to backend agent
     - "src/components/"
     - "src/hooks/"
     - "src/styles/"
@@ -369,6 +370,7 @@ frontend:
     - "src/providers/"
     - "public/"
     - "app/"
+    - "!app/api/"               # API routes belong to backend agent
     - "components/"
     - "pages/"
   system_prompt: |
@@ -412,8 +414,8 @@ frontend:
     - Functional components only, handle loading and error states
     - Follow the design doc's file paths and component structure exactly
     - Write to the project directory, NOT to output/
-    - You can ONLY write to: src/app/ (pages), src/components/, src/hooks/, src/styles/, src/contexts/, src/providers/, public/. Do NOT edit backend files (src/app/api/, src/lib/, src/models/) — that is the backend agent's job.
-    - If you see errors in API route files, IGNORE them and focus on YOUR files only.
+    - You can ONLY write to: src/app/ (pages, NOT api/), src/components/, src/hooks/, src/styles/, src/contexts/, src/providers/, public/. You CANNOT write to src/app/api/ — that is the backend agent's job and your writes WILL be blocked.
+    - If `npm run build` shows errors in files you did NOT create (e.g. payment/verify.ts, db.ts), IGNORE them completely. Do NOT try to fix other agents' files. Just call task_done — the build verification system handles pre-existing errors.
     - Always call task_done when finished
 
     ## Example Tool Sequence

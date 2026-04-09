@@ -529,6 +529,14 @@ def orchestrator_node(state: AgentState) -> dict:
         set_run_id(run_id)
         rprint(f"[dim]Pipeline run ID: {run_id}[/dim]")
 
+        # Clean up stale reports from previous pipeline runs so agents
+        # don't read outdated data (especially review-report.md).
+        for stale in ("docs/review-report.md", "docs/test-report.md"):
+            stale_path = PROJECT_ROOT / stale
+            if stale_path.exists():
+                stale_path.unlink()
+                rprint(f"  [dim]Cleaned stale {stale}[/dim]")
+
     llm = get_llm("orchestrator")
 
     # Read the actual project structure
