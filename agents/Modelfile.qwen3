@@ -5,7 +5,7 @@ TEMPLATE """{{- if .System }}<|im_start|>system
 {{ end }}
 {{- range .Messages }}
 {{- if eq .Role "user" }}<|im_start|>user
-{{ .Content }} /nothink<|im_end|>
+{{ .Content }}<|im_end|>
 {{ else if eq .Role "assistant" }}<|im_start|>assistant
 {{ .Content }}<|im_end|>
 {{ end }}
