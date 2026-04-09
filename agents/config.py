@@ -13,6 +13,7 @@ load_dotenv(_ENV_PATH)
 
 # ── LLM Provider ────────────────────────────────────────────────
 # "claude" = Anthropic API (requires ANTHROPIC_API_KEY)
+# "groq"   = Groq Cloud API (requires GROQ_API_KEY) — free tier available
 # "ollama" = local Ollama (default)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
 
@@ -117,7 +118,6 @@ def get_llm(role: str = "specialist"):
     if LLM_PROVIDER == "claude":
         from langchain_anthropic import ChatAnthropic
 
-        # Claude uses max_tokens for output length
         max_tokens = 4096 if role == "orchestrator" else 8192
 
         return ChatAnthropic(
@@ -126,6 +126,23 @@ def get_llm(role: str = "specialist"):
             max_tokens=max_tokens,
             timeout=120,
         )
+
+    elif LLM_PROVIDER == "groq":
+        from langchain_groq import ChatGroq
+
+        groq_api_key = os.getenv("GROQ_API_KEY", "")
+        if not groq_api_key:
+            raise ValueError("GROQ_API_KEY not set in .env")
+
+        max_tokens = 4096 if role == "orchestrator" else 8192
+
+        return ChatGroq(
+            model=model,
+            api_key=groq_api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
     else:
         from langchain_ollama import ChatOllama
 
