@@ -945,10 +945,42 @@ def run_agent_loop(
     prompt_parts.append(f"\n## Project Directory\n{PROJECT_ROOT}")
 
     if prev_files:
-        prompt_parts.append(
-            f"\n## Files From Previous Agents (read these first!)\n"
-            + "\n".join(f"- {f}" for f in prev_files)
-        )
+        # Force-feed actual file contents — 14B models are too lazy to call
+        # read_file on their own and will hallucinate API contracts instead.
+        unique_files = list(dict.fromkeys(prev_files))
+        injected = []
+        total_chars = 0
+        max_context_budget = 6000  # chars budget for previous agent files
+        for f in unique_files[-6:]:  # last 6 unique files
+            filepath = PROJECT_ROOT / f
+            if not filepath.exists() or not filepath.is_file():
+                continue
+            if filepath.suffix not in (".ts", ".tsx", ".js", ".jsx", ".py", ".json", ".md"):
+                continue
+            try:
+                content = filepath.read_text(encoding="utf-8")
+                # Truncate large files but keep enough for imports/exports
+                if len(content) > 1500:
+                    content = content[:1500] + "\n// ... (truncated, use read_file for full content)"
+                if total_chars + len(content) > max_context_budget:
+                    break
+                injected.append(f"\n### {f}\n```\n{content}\n```")
+                total_chars += len(content)
+            except Exception:
+                continue
+
+        if injected:
+            prompt_parts.append(
+                "\n## Code Written by Previous Agents\n"
+                "Review this code to ensure you integrate with it correctly. "
+                "Import from these files — do NOT recreate their types or functions.\n"
+                + "\n".join(injected)
+            )
+        else:
+            prompt_parts.append(
+                f"\n## Files From Previous Agents\n"
+                + "\n".join(f"- {f}" for f in unique_files)
+            )
 
     if rag_context:
         prompt_parts.append(f"\n## Context From Memory\n{rag_context}")
@@ -981,13 +1013,12 @@ def run_agent_loop(
     ))
 
     # ── ReAct loop: Think → Act → Observe → repeat ───────────────
-    from config import LLM_PROVIDER
-    # Append /nothink for local models (qwen3) to disable expensive thinking mode.
-    # Not needed for Claude — it uses tool calling natively.
-    suffix = "\n\n/nothink" if LLM_PROVIDER == "ollama" else ""
+    # Note: /nothink removed. qwen2.5-coder doesn't have thinking mode,
+    # and for qwen3 we disable it via reasoning=False in config.py.
+    # Appending /nothink was wasting tokens and hurting model reasoning.
     messages = [
         SystemMessage(content=system_prompt),
-        HumanMessage(content=task_prompt + suffix),
+        HumanMessage(content=task_prompt),
     ]
 
     files_changed = []

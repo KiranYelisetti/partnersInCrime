@@ -566,12 +566,10 @@ def orchestrator_node(state: AgentState) -> dict:
 
     prompt = "\n".join(prompt_parts)
 
-    # Call LLM (/nothink only for local models to disable thinking mode)
-    from config import LLM_PROVIDER
-    suffix = "\n\n/nothink" if LLM_PROVIDER == "ollama" else ""
+    # Call LLM (thinking mode handled by reasoning=False in config.py)
     response = _invoke_with_retry(llm, [
         SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=prompt + suffix),
+        HumanMessage(content=prompt),
     ])
 
     rprint(f"\n[dim]Orchestrator raw: {response.content[:400]}[/dim]\n")
