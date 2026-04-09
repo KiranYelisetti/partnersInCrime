@@ -171,7 +171,16 @@ def run_command(command: str) -> str:
         run_command("npm run dev")
         run_command("pytest tests/ -v")
     """
-    return _run(command)
+    result = _run(command)
+
+    # Filter build errors to only show agent's own files
+    if "npm run build" in command and "Exit code:" in result:
+        from tools.hooks import get_current_agent
+        agent = get_current_agent()
+        if agent:
+            result = _filter_build_errors(result, agent)
+
+    return result
 
 
 @tool
@@ -237,6 +246,72 @@ def npm_install(packages: str = "") -> str:
         return _run("npm install", timeout=120)
 
 
+def _filter_build_errors(output: str, agent_name: str) -> str:
+    """
+    Filter build output to only show errors in files the current agent owns.
+    If ALL errors are in other agents' files, return a short "pre-existing" message
+    so the agent doesn't waste iterations trying to fix them.
+    """
+    import re
+    from tools.hooks import get_current_agent, AGENT_WRITE_SCOPES
+
+    if not agent_name or "Error" not in output and "error" not in output:
+        return output
+
+    scopes = AGENT_WRITE_SCOPES.get(agent_name)
+    if scopes is None or len(scopes) == 0:
+        return output  # Unrestricted agent — show everything
+
+    includes = [s for s in scopes if not s.startswith("!")]
+    excludes = [s[1:] for s in scopes if s.startswith("!")]
+
+    def _is_my_file(filepath: str) -> bool:
+        """Check if a file path falls within this agent's write scope."""
+        fp = filepath.replace("\\", "/")
+        for exc in excludes:
+            if fp.startswith(exc):
+                return False
+        for inc in includes:
+            if fp.startswith(inc):
+                return True
+        return False
+
+    # Extract error lines referencing files (TypeScript pattern: ./src/path/file.ts)
+    lines = output.split("\n")
+    my_errors = []
+    other_errors = 0
+    for line in lines:
+        # Match TS error patterns like "./src/app/api/payment/verify.ts(3,30)"
+        # or "src/app/api/payment/verify.ts:3:30"
+        match = re.search(r'[./]*((src|app|pages|components)/\S+?\.(ts|tsx|js|jsx))', line)
+        if match:
+            filepath = match.group(1).lstrip("./")
+            if _is_my_file(filepath):
+                my_errors.append(line)
+            else:
+                other_errors += 1
+        else:
+            # Non-file-reference lines (summaries, etc.) — keep them
+            my_errors.append(line)
+
+    if other_errors > 0 and not any("error" in l.lower() for l in my_errors if re.search(r'src/\S+\.(ts|tsx)', l)):
+        return (
+            f"Build has errors, but ALL {other_errors} error(s) are in OTHER agents' files "
+            f"(outside your scope: {includes}). These are pre-existing issues you cannot fix.\n"
+            f"YOUR code compiled successfully. Proceed with task_done."
+        )
+
+    if other_errors > 0:
+        filtered = "\n".join(my_errors)
+        return (
+            f"{filtered}\n\n"
+            f"NOTE: {other_errors} additional error(s) in other agents' files were hidden. "
+            f"Focus only on errors in YOUR files."
+        )
+
+    return output
+
+
 @tool
 def npm_run(script: str) -> str:
     """Run a one-shot npm script defined in package.json.
@@ -259,7 +334,16 @@ def npm_run(script: str) -> str:
             f"For build verification use npm_run('build'). "
             f"For tests use npm_run('test')."
         )
-    return _run(f"npm run {safe}", timeout=120)
+    result = _run(f"npm run {safe}", timeout=120)
+
+    # For build scripts, filter errors to only show agent's own files
+    if safe.lower() == "build" and "Exit code:" in result:
+        from tools.hooks import get_current_agent
+        agent = get_current_agent()
+        if agent:
+            result = _filter_build_errors(result, agent)
+
+    return result
 
 
 @tool
