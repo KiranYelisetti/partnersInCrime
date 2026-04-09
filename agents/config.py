@@ -134,7 +134,8 @@ def get_llm(role: str = "specialist"):
         if not groq_api_key:
             raise ValueError("GROQ_API_KEY not set in .env")
 
-        max_tokens = 4096 if role == "orchestrator" else 8192
+        # Free tier has TPM limits — keep output concise
+        max_tokens = 2048 if role == "orchestrator" else 4096
 
         return ChatGroq(
             model=model,

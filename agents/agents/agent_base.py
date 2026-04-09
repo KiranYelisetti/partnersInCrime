@@ -260,10 +260,11 @@ def _invoke_with_retry(llm, messages, max_attempts=3, cooldown=None):
                 "status code: 500", "internal server error", "model is loading",
             ])
 
-            # Claude API transient errors
-            claude_transient = any(phrase in error_str for phrase in [
+            # Cloud API transient errors (Claude, Groq, OpenRouter, etc.)
+            api_transient = any(phrase in error_str for phrase in [
                 "429",                  # rate limit
                 "rate limit",
+                "rate_limit_exceeded",
                 "overloaded",           # 529 overloaded
                 "529",
                 "timeout",              # request timeout
@@ -271,19 +272,25 @@ def _invoke_with_retry(llm, messages, max_attempts=3, cooldown=None):
                 "server error",         # 500 internal
                 "bad gateway",          # 502
                 "service unavailable",  # 503
+                "tool_use_failed",      # Groq: model generated malformed tool call
+                "failed_generation",    # Groq: tool call format mismatch
+                "tokens per minute",    # Groq: TPM rate limit
             ])
 
-            is_transient = ollama_transient or claude_transient
+            is_transient = ollama_transient or api_transient
 
             if is_transient and attempt < max_attempts - 1:
-                if claude_transient and "429" in error_str or "rate limit" in error_str:
-                    # Rate limits need longer backoff
+                if "rate limit" in error_str or "429" in error_str or "tokens per minute" in error_str:
                     wait = (attempt + 1) * 15
-                    rprint(f"  [yellow]Claude rate limit hit, waiting {wait}s... "
+                    rprint(f"  [yellow]API rate limit hit, waiting {wait}s... "
                            f"({attempt + 1}/{max_attempts})[/yellow]")
-                elif claude_transient:
+                elif "tool_use_failed" in error_str or "failed_generation" in error_str:
+                    wait = (attempt + 1) * 5
+                    rprint(f"  [yellow]Tool call format error, retrying in {wait}s... "
+                           f"({attempt + 1}/{max_attempts})[/yellow]")
+                elif api_transient:
                     wait = (attempt + 1) * 10
-                    rprint(f"  [yellow]Claude API error, waiting {wait}s... "
+                    rprint(f"  [yellow]API error, waiting {wait}s... "
                            f"({attempt + 1}/{max_attempts})[/yellow]")
                 else:
                     wait = (attempt + 1) * 8
