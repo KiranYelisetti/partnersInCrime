@@ -33,6 +33,7 @@ from agents.infra_agent import infra_node, set_dependencies as infra_set_deps
 from agents.uiux_agent import uiux_node, set_dependencies as uiux_set_deps
 from agents.testing_agent import testing_node, set_dependencies as test_set_deps
 from agents.architect_agent import architect_node, set_dependencies as arch_set_deps
+from agents.reviewer_agent import reviewer_node, set_dependencies as rev_set_deps
 
 # Import memory layer
 from memory.vector_store import AgentMemory
@@ -40,7 +41,7 @@ from memory.state_store import StateStore
 
 console = Console()
 
-VALID_AGENTS = {"architect", "backend", "frontend", "database", "infra", "uiux", "testing"}
+VALID_AGENTS = {"architect", "backend", "frontend", "database", "infra", "uiux", "reviewer", "testing"}
 
 
 # ── Initialize memory and state ──────────────────────────────────
@@ -57,7 +58,7 @@ def init_system():
     rprint(f"[dim]  State store ready — mode: {state_store.mode}[/dim]")
 
     for setter in [orch_set_deps, arch_set_deps, be_set_deps, fe_set_deps,
-                   db_set_deps, infra_set_deps, uiux_set_deps, test_set_deps]:
+                   db_set_deps, infra_set_deps, uiux_set_deps, rev_set_deps, test_set_deps]:
         setter(memory=memory, state_store=state_store)
 
     return memory, state_store
@@ -111,6 +112,7 @@ def build_graph():
         ("database",     database_node),
         ("infra",        infra_node),
         ("uiux",         uiux_node),
+        ("reviewer",     reviewer_node),
         ("testing",      testing_node),
         ("human_node",   human_node),
     ]
@@ -128,6 +130,7 @@ def build_graph():
         "database":   "database",
         "infra":      "infra",
         "uiux":       "uiux",
+        "reviewer":   "reviewer",
         "testing":    "testing",
         "human_node": "human_node",
         "END":         END,
@@ -154,12 +157,13 @@ def print_banner():
     table.add_row("Database", "Schemas, models, ORM setup — autonomous with tools")
     table.add_row("UI/UX",    "Design specs, layouts, tokens — autonomous with tools")
     table.add_row("Infra",    "Project setup, configs, Docker, CI/CD — autonomous with tools")
+    table.add_row("Reviewer", "Integration review — catches frontend/backend mismatches")
     table.add_row("Testing",  "Writes & runs tests, fixes failures — autonomous with tools")
 
     console.print(Panel(
         table,
         title="[bold green]Partners in Crime — Autonomous Agent System[/bold green]",
-        subtitle="[dim]All 7 agents online — architect designs, specialists build[/dim]",
+        subtitle="[dim]All 8 agents online — architect designs, specialists build, reviewer validates[/dim]",
         border_style="green",
     ))
 

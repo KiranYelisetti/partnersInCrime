@@ -30,28 +30,32 @@ from agents.agent_base import _invoke_with_retry, set_run_id, get_run_id
 
 SYSTEM_PROMPT = """You are the orchestrator of a multi-agent dev team. You create a plan and dispatch agents.
 
-AGENTS: infra, architect, database, backend, frontend, uiux, testing
+AGENTS: infra, architect, database, backend, frontend, uiux, reviewer, testing
 - infra: scaffolds project (create-next-app, etc.), installs deps
-- architect: reads project + reference code, writes technical design doc
+- architect: reads project + reference code, writes technical design doc AND api-contract.json
 - database: creates data models/schemas following the design doc
-- backend: creates API endpoints following the design doc
-- frontend: creates UI components/pages following the design doc
+- backend: creates API endpoints following the design doc and api-contract.json
+- frontend: creates UI components/pages following the design doc and api-contract.json
 - uiux: creates design specs (use BEFORE frontend if UI decisions needed)
-- testing: writes+runs tests, verifies build passes
+- reviewer: checks frontend/backend alignment against api-contract.json, reports mismatches
+- testing: runs build, reports bugs, verifies fixes
 
 ROUTING:
-- NEW project (empty dir) → infra → architect → database → backend → frontend → testing
-- EXISTING project, multi-agent → architect → specialists → testing
-- Single-agent fix → just that agent
+- NEW project (empty dir) → infra → architect → database → backend → frontend → reviewer → testing
+- EXISTING project, multi-agent → architect → specialists → reviewer → testing
+- Single-agent fix → just that agent (no reviewer needed)
+- Always put reviewer BEFORE testing (catches integration bugs cheaply)
 - Always end with testing
 
 RESPOND IN THIS EXACT JSON FORMAT ONLY:
-{"plan":["infra","architect","database","backend","frontend","testing"],"plan_details":{"infra":"what to do","architect":"what to do","database":"what to do","backend":"what to do","frontend":"what to do","testing":"what to do"},"reasoning":"why"}
+{"plan":["infra","architect","database","backend","frontend","reviewer","testing"],"plan_details":{"infra":"what to do","architect":"what to do","database":"what to do","backend":"what to do","frontend":"what to do","reviewer":"review frontend/backend alignment against api-contract.json","testing":"what to do"},"reasoning":"why"}
 
 RULES:
-- plan_details: tell each agent WHAT to build (business requirements), not HOW
+- plan_details: keep each subtask description to ONE sentence (max 50 words). Be concise.
 - Each agent is autonomous with file read/write/run tools
 - If you need human input: {"plan":["human"],"plan_details":{"human":"your question"},"reasoning":"need info"}
+- reasoning: ONE sentence max
+- Output ONLY valid JSON, nothing else
 """
 
 _memory = None
@@ -136,6 +140,55 @@ def _get_project_structure(max_depth: int = 3) -> str:
             break
 
     return "\n".join(lines) if file_count > 0 else "Project directory is empty (new project)"
+
+
+def _parse_review_report() -> dict:
+    """
+    Read docs/review-report.md written by the reviewer agent.
+    Extract mismatches grouped by responsible agent (backend/frontend).
+    Returns: {"has_mismatches": bool, "backend": [...], "frontend": [...], "raw": str}
+    """
+    import re
+
+    report_path = PROJECT_ROOT / "docs" / "review-report.md"
+    if not report_path.exists():
+        return {"has_mismatches": False, "raw": "", "backend": [], "frontend": []}
+
+    content = report_path.read_text(encoding="utf-8")
+
+    if "status: pass" in content.lower():
+        return {"has_mismatches": False, "raw": content, "backend": [], "frontend": []}
+
+    errors_by_owner = {"backend": [], "frontend": []}
+
+    # Split by "## Endpoint" blocks
+    blocks = re.split(r'^## Endpoint', content, flags=re.MULTILINE)
+    for block in blocks[1:]:  # skip header
+        # Check for MISMATCH markers
+        if "MISMATCH" not in block.upper():
+            continue
+        # Classify by which side has the mismatch
+        if re.search(r'Backend.*MISMATCH', block, re.IGNORECASE):
+            errors_by_owner["backend"].append("Endpoint" + block.strip())
+        if re.search(r'Frontend.*MISMATCH', block, re.IGNORECASE):
+            errors_by_owner["frontend"].append("Endpoint" + block.strip())
+
+    # Fallback: if MISMATCH found but not classified, check for file paths
+    if not any(errors_by_owner.values()) and "mismatch" in content.lower():
+        for line in content.split("\n"):
+            if "mismatch" in line.lower():
+                if "backend" in line.lower() or "/api/" in line:
+                    errors_by_owner["backend"].append(line.strip())
+                elif "frontend" in line.lower() or "/component" in line:
+                    errors_by_owner["frontend"].append(line.strip())
+
+    has_mismatches = any(errors_by_owner.values())
+    return {
+        "has_mismatches": has_mismatches,
+        "backend": errors_by_owner["backend"],
+        "frontend": errors_by_owner["frontend"],
+        "raw": content,
+    }
 
 
 def _parse_test_report() -> dict:
@@ -246,7 +299,7 @@ def orchestrator_node(state: AgentState) -> dict:
         last_msg = state["messages"][-1] if state["messages"] else {}
         last_role = last_msg.get("role", "")
 
-        if last_role in ("architect", "backend", "frontend", "database", "infra", "uiux", "testing"):
+        if last_role in ("architect", "backend", "frontend", "database", "infra", "uiux", "reviewer", "testing"):
             next_step = current_step + 1
 
             # Collect what the last agent produced
@@ -255,11 +308,59 @@ def orchestrator_node(state: AgentState) -> dict:
             if isinstance(last_content, dict):
                 last_files = last_content.get("files_changed", [])
             # Also accumulate from state
-            all_files = state.get("files_changed", [])
+            all_files = list(dict.fromkeys(state.get("files_changed", [])))
 
             if next_step < len(plan):
                 next_agent = plan[next_step]
                 agent_subtask = plan_details.get(next_agent, state["task"])
+
+                # ── Reviewer → Testing transition: check for mismatches ──
+                # If reviewer just ran and found mismatches, inject a fix round
+                # BEFORE testing so we don't waste an expensive build cycle.
+                if last_role == "reviewer" and next_agent == "testing":
+                    review = _parse_review_report()
+                    if review["has_mismatches"]:
+                        fix_plan = []
+                        fix_details = {}
+                        for agent_name in ["backend", "frontend"]:
+                            agent_errors = review.get(agent_name, [])
+                            if agent_errors:
+                                fix_plan.append(agent_name)
+                                error_text = "\n".join(agent_errors[:5])
+                                fix_details[agent_name] = (
+                                    f"REVIEW FIX: The integration reviewer found mismatches in YOUR code. "
+                                    f"Read docs/review-report.md for details.\n\n"
+                                    f"YOUR MISMATCHES:\n{error_text}\n\n"
+                                    f"Read the review report, fix the mismatches to match "
+                                    f"docs/architecture/api-contract.json, then call task_done."
+                                )
+                        # After fixes, continue with testing
+                        fix_plan.append("testing")
+                        fix_details["testing"] = plan_details.get("testing", state["task"])
+
+                        rprint(Panel(
+                            f"[bold yellow]REVIEWER FOUND MISMATCHES[/bold yellow]\n"
+                            + "\n".join(f"  {a}: {len(review.get(a, []))} mismatch(es)" for a in ["backend", "frontend"])
+                            + f"\n[bold]Fix plan:[/bold] {' -> '.join(fix_plan)}",
+                            title="[yellow]Orchestrator — Review Fix[/yellow]",
+                        ))
+
+                        first_agent = fix_plan[0]
+                        design_doc = _read_design_docs()
+
+                        return {
+                            "next_agent": first_agent,
+                            "agent_plan": fix_plan,
+                            "_plan_details": fix_details,
+                            "current_step": 0,
+                            "messages": [{"role": "orchestrator", "content": {
+                                "subtask": fix_details[first_agent],
+                                "reasoning": f"Reviewer found mismatches, fixing {first_agent} before testing",
+                                "files_from_previous": all_files,
+                                "design_doc": design_doc,
+                            }}],
+                            "needs_human": False,
+                        }
 
                 # Inject design docs so every agent follows the architect's spec
                 design_doc = _read_design_docs()
@@ -310,16 +411,35 @@ def orchestrator_node(state: AgentState) -> dict:
                             "needs_human": False,
                         }
 
-                    # Build failed — route fixes to responsible agents
+                    # Build failed — route fixes to responsible agents.
+                    # Only include errors in files that agents actually
+                    # created/modified during this pipeline run. Pre-existing
+                    # broken files are not the agents' responsibility.
                     new_fix_round = fix_round + 1
                     fix_plan = []
                     fix_details = {}
 
+                    # Normalize pipeline files for matching
+                    pipeline_files = set()
+                    for f in all_files:
+                        normalized = f.replace("\\", "/").lstrip("./")
+                        pipeline_files.add(normalized)
+                        # Also add just the filename for fuzzy matching
+                        pipeline_files.add(normalized.split("/")[-1])
+
                     for agent_name in ["database", "backend", "frontend", "infra"]:
                         agent_errors = report.get(agent_name, [])
-                        if agent_errors:
+                        # Filter: only keep errors that mention files this pipeline touched
+                        relevant_errors = []
+                        for err in agent_errors:
+                            err_normalized = err.replace("\\", "/")
+                            is_relevant = any(pf in err_normalized for pf in pipeline_files if len(pf) > 3)
+                            if is_relevant:
+                                relevant_errors.append(err)
+
+                        if relevant_errors:
                             fix_plan.append(agent_name)
-                            error_text = "\n".join(agent_errors[:10])  # Cap at 10 errors
+                            error_text = "\n".join(relevant_errors[:10])
                             fix_details[agent_name] = (
                                 f"FIX ROUND {new_fix_round}: The tester found build errors in YOUR files. "
                                 f"Read the test report at docs/test-report.md for full details.\n\n"
@@ -327,11 +447,31 @@ def orchestrator_node(state: AgentState) -> dict:
                                 f"Steps:\n"
                                 f"1. Read docs/test-report.md for the full error report\n"
                                 f"2. Read the failing files\n"
-                                f"3. Fix the errors\n"
+                                f"3. Fix ONLY files you created — do NOT fix pre-existing files\n"
                                 f"4. Call task_done when fixed"
                             )
+                        elif agent_errors:
+                            rprint(f"  [dim]{agent_name}: {len(agent_errors)} error(s) "
+                                   f"in pre-existing files — skipped[/dim]")
 
-                    # Always end fix round with testing (retest)
+                    # If no relevant errors (all pre-existing), skip fix loop
+                    if not fix_plan:
+                        rprint(Panel(
+                            f"[bold green]BUILD ERRORS ARE ALL PRE-EXISTING[/bold green]\n"
+                            f"All {sum(len(report.get(a, [])) for a in ['backend', 'frontend', 'database', 'infra'])} "
+                            f"error(s) are in files that existed before this pipeline ran.\n"
+                            f"The agents' code is correct — skipping fix loop.",
+                            title="[green]Orchestrator — Skipping Fix Loop[/green]",
+                        ))
+                        return {
+                            "next_agent": "END",
+                            "agent_plan": None,
+                            "_plan_details": None,
+                            "messages": [{"role": "orchestrator", "content": "Build has only pre-existing errors — agents' work is done"}],
+                            "needs_human": False,
+                        }
+
+                    # End fix round with testing (retest)
                     fix_plan.append("testing")
                     fix_details["testing"] = (
                         f"VERIFICATION ROUND {new_fix_round}: "
@@ -436,14 +576,70 @@ def orchestrator_node(state: AgentState) -> dict:
 
     rprint(f"\n[dim]Orchestrator raw: {response.content[:400]}[/dim]\n")
 
-    # Parse response
+    # Parse response — robust extraction that handles malformed JSON
     try:
         clean = response.content.strip()
         # Strip thinking tags if model still produces them
         import re as _re
         clean = _re.sub(r'<think>.*?</think>', '', clean, flags=_re.DOTALL).strip()
         clean = clean.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        decision = json.loads(clean)
+
+        # Try direct parse first
+        decision = None
+        try:
+            decision = json.loads(clean)
+        except json.JSONDecodeError:
+            pass
+
+        # Fallback: extract the first JSON object from the text
+        if decision is None:
+            brace_start = clean.find("{")
+            if brace_start >= 0:
+                depth = 0
+                in_string = False
+                escape_next = False
+                for i, ch in enumerate(clean[brace_start:], brace_start):
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if ch == "\\":
+                        escape_next = True
+                        continue
+                    if ch == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                decision = json.loads(clean[brace_start:i + 1])
+                            except json.JSONDecodeError:
+                                pass
+                            break
+
+        # Last resort: try to repair truncated JSON by closing brackets
+        if decision is None and "{" in clean:
+            fragment = clean[clean.find("{"):]
+            # Close any open strings, arrays, objects
+            fragment = fragment.rstrip(",\n\r\t ")
+            open_braces = fragment.count("{") - fragment.count("}")
+            open_brackets = fragment.count("[") - fragment.count("]")
+            # Close open strings (crude)
+            if fragment.count('"') % 2 != 0:
+                fragment += '"'
+            fragment += "]" * max(0, open_brackets)
+            fragment += "}" * max(0, open_braces)
+            try:
+                decision = json.loads(fragment)
+            except json.JSONDecodeError:
+                pass
+
+        if decision is None:
+            raise json.JSONDecodeError("Could not extract valid JSON", clean, 0)
 
         plan = decision.get("plan", [])
         plan_details = decision.get("plan_details", {})

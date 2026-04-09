@@ -5,6 +5,7 @@ Sandboxed with command allowlist and timeout.
 import subprocess
 import shlex
 import platform
+import re
 from pathlib import Path
 from langchain_core.tools import tool
 from config import (
@@ -25,6 +26,41 @@ def _get_command_name(cmd_str: str) -> str:
     return Path(parts[0]).stem.lower()
 
 
+# ── Denylist: long-running / interactive commands that would hang agents ─
+# These are valid commands but start servers/watchers that never exit.
+# Agents must use `npm run build` (one-shot) instead of `npm run dev`.
+_DENY_PATTERNS = [
+    # Dev servers — start HTTP servers that never exit
+    r"\bnpm\s+(run\s+)?(dev|start|serve|watch)\b",
+    r"\bnpm\s+run\s+dev(:|$|\s)",
+    r"\bnext\s+(dev|start)\b",
+    r"^\s*vite\s*$",                 # Plain `vite` alone starts dev server
+    r"\bvite\s+dev\b",
+    r"\bvite\s+preview\b",
+    r"\bvite\s+serve\b",
+    r"\bwebpack\s+(serve|--watch|-w\b)",
+    r"\btsc\s+(--watch|-w\b)",
+    r"\bnodemon\b",
+    r"\bnpx\s+(next|vite|nodemon)\s+(dev|start|serve|watch)",
+    r"\bnpx\s+serve\b",
+    # Interactive prompts / REPLs
+    r"\bnpm\s+init(\s|$)(?!.*-y)",   # `npm init` without -y waits for input
+    r"\bnode\s*$",                    # Plain `node` starts REPL
+    r"\bpython\s*$",                  # Plain `python` starts REPL
+    # Infinite loops / long-running watchers
+    r"\btail\s+-f\b",
+    r"\bwatch\b",
+]
+
+
+def _is_denied_command(cmd: str) -> str:
+    """Return a reason if the command is on the denylist, empty string if OK."""
+    for pat in _DENY_PATTERNS:
+        if re.search(pat, cmd, re.IGNORECASE):
+            return pat
+    return ""
+
+
 def _run(cmd: str, timeout: int = None, cwd: str = None) -> str:
     """Run a shell command with safety checks."""
     timeout = timeout or COMMAND_TIMEOUT
@@ -39,20 +75,67 @@ def _run(cmd: str, timeout: int = None, cwd: str = None) -> str:
             f"Add it to ALLOWED_COMMANDS in .env if you trust this command."
         )
 
-    try:
-        # Use shell=True on Windows for proper command resolution
-        use_shell = platform.system() == "Windows"
-        result = subprocess.run(
-            cmd,
-            shell=use_shell,
-            cwd=work_dir,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+    # Safety: block long-running commands (dev servers, REPLs, watchers)
+    denied = _is_denied_command(cmd)
+    if denied:
+        return (
+            f"Error: Command BLOCKED — '{cmd}' is a long-running / interactive command "
+            f"that would hang the agent loop (matched denylist pattern: {denied}).\n"
+            f"For build verification use 'npm run build' (one-shot compile), "
+            f"NOT 'npm run dev' (starts a dev server that never exits).\n"
+            f"For type-checking use 'npx tsc --noEmit' (not 'tsc --watch')."
         )
 
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
+    try:
+        is_windows = platform.system() == "Windows"
+
+        # On Windows, use CREATE_NEW_PROCESS_GROUP so we can kill the whole tree
+        # if timeout fires. Otherwise npm.cmd → node child survives and its pipes
+        # keep subprocess.communicate() hanging forever.
+        popen_kwargs = {
+            "cwd": work_dir,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": is_windows,
+            "text": True,
+        }
+        if is_windows:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True  # POSIX: new process group
+
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            # Hard kill the entire process tree.
+            if is_windows:
+                # taskkill /T kills the whole tree including node.exe children
+                subprocess.run(
+                    f"taskkill /F /T /PID {proc.pid}",
+                    shell=True, capture_output=True, timeout=10,
+                )
+            else:
+                import os, signal
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+            # Reap the process so pipes close
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except Exception:
+                stdout, stderr = "", ""
+            return (
+                f"Error: Command timed out after {timeout}s and was force-killed: {cmd}\n"
+                f"If this was a dev server, use 'npm run build' instead. "
+                f"Agents should never start long-running processes."
+            )
+
+        stdout = (stdout or "").strip()
+        stderr = (stderr or "").strip()
 
         # Truncate long output
         if len(stdout) > MAX_COMMAND_OUTPUT:
@@ -65,13 +148,11 @@ def _run(cmd: str, timeout: int = None, cwd: str = None) -> str:
             output_parts.append(f"stdout:\n{stdout}")
         if stderr:
             output_parts.append(f"stderr:\n{stderr}")
-        if result.returncode != 0:
-            output_parts.insert(0, f"Exit code: {result.returncode}")
+        if returncode != 0:
+            output_parts.insert(0, f"Exit code: {returncode}")
 
         return "\n\n".join(output_parts) if output_parts else "(no output, exit code 0)"
 
-    except subprocess.TimeoutExpired:
-        return f"Error: Command timed out after {timeout}s: {cmd}"
     except FileNotFoundError:
         return f"Error: Command not found: {cmd}"
     except Exception as e:
@@ -158,13 +239,26 @@ def npm_install(packages: str = "") -> str:
 
 @tool
 def npm_run(script: str) -> str:
-    """Run an npm script defined in package.json.
+    """Run a one-shot npm script defined in package.json.
+    Use this for 'build', 'test', 'lint', 'typecheck' — scripts that run once and exit.
     Args:
-        script: The script name (e.g. "build", "dev", "test", "lint")
+        script: The script name (e.g. "build", "test", "lint")
+    NOTE: Long-running scripts like 'dev', 'start', 'serve', 'watch' are BLOCKED.
+    They start servers that never exit and would hang the agent loop.
+    For build verification use 'build'.
     """
     safe = script.strip().split()[0]  # Take only the script name
     if not all(c.isalnum() or c in "-_:" for c in safe):
         return f"Error: Invalid script name: {safe}"
+    # Block long-running scripts — same denylist as run_command
+    forbidden = {"dev", "start", "serve", "watch"}
+    if safe.lower() in forbidden or any(safe.lower().startswith(f + ":") for f in forbidden):
+        return (
+            f"Error: npm script '{safe}' is blocked — it starts a long-running process "
+            f"that never exits and would hang the agent loop. "
+            f"For build verification use npm_run('build'). "
+            f"For tests use npm_run('test')."
+        )
     return _run(f"npm run {safe}", timeout=120)
 
 

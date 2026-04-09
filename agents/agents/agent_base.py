@@ -108,7 +108,13 @@ class AgentLogger:
 # ── Cycle Detector: catches repetitive tool call loops ───────────
 
 class CycleDetector:
-    """Tracks consecutive identical tool calls and detects loops."""
+    """Tracks identical tool calls and detects loops.
+
+    Returns (message, severity) from check():
+      severity = "none"  — no issue
+      severity = "warn"  — warn the agent, keep going
+      severity = "stop"  — hard stop, the agent is in a pathological loop
+    """
 
     def __init__(self, max_identical: int = MAX_IDENTICAL_TOOL_CALLS):
         self.max_identical = max_identical
@@ -121,15 +127,19 @@ class CycleDetector:
         args_str = json.dumps(tool_args, sort_keys=True, default=str)
         return hashlib.md5(f"{tool_name}:{args_str}".encode()).hexdigest()
 
-    def check(self, tool_name: str, tool_args: dict) -> Optional[str]:
+    def check(self, tool_name: str, tool_args: dict) -> tuple[Optional[str], str]:
         """
         Record a tool call and check for cycles.
-        Returns an error message if cycle detected, None otherwise.
+        Returns (message, severity) where severity is one of:
+          "none" — no cycle detected
+          "warn" — warn the agent to change approach
+          "stop" — hard stop, the agent is in a pathological loop
         """
         sig = self._make_signature(tool_name, tool_args)
 
         # Track global frequency
         self._all_signatures[sig] = self._all_signatures.get(sig, 0) + 1
+        total_count = self._all_signatures[sig]
 
         # Track consecutive identical calls
         if sig == self._last_signature:
@@ -138,23 +148,48 @@ class CycleDetector:
             self._last_signature = sig
             self._consecutive_count = 1
 
+        # ── Hard stop: consecutive repeats beyond warning threshold ──
+        if self._consecutive_count >= self.max_identical + 1:
+            return (
+                f"CYCLE DETECTED (HARD STOP): You called `{tool_name}` with the same "
+                f"arguments {self._consecutive_count} times in a row despite being warned. "
+                f"Terminating this agent step.",
+                "stop",
+            )
+
+        # ── Hard stop: non-consecutive repetition past ceiling ──
+        # Agent is interleaving a harmless read between failed writes to avoid
+        # the consecutive counter. Stop it by total count too.
+        if total_count >= self.max_identical + 4:
+            return (
+                f"CYCLE DETECTED (HARD STOP): You called `{tool_name}` with the same "
+                f"arguments {total_count} times total — your approach is not working "
+                f"and you are not making progress. Terminating this agent step.",
+                "stop",
+            )
+
+        # ── Warn: consecutive cycle at warning threshold ──
         if self._consecutive_count >= self.max_identical:
             return (
                 f"CYCLE DETECTED: You called `{tool_name}` with the same arguments "
                 f"{self._consecutive_count} times in a row. You are stuck in a loop. "
-                f"STOP repeating this action. Try a DIFFERENT approach or call task_done "
-                f"if you cannot proceed."
+                f"STOP repeating this action. Try a DIFFERENT approach (read the file "
+                f"to see current state, or use a different tool) or call task_done "
+                f"if you cannot proceed. Next repeat WILL terminate this step.",
+                "warn",
             )
 
-        # Also catch non-consecutive repeats (same call 5+ times total)
-        if self._all_signatures[sig] >= self.max_identical + 2:
+        # ── Warn: non-consecutive repetition approaching ceiling ──
+        if total_count >= self.max_identical + 2:
             return (
                 f"REPETITION WARNING: You have called `{tool_name}` with identical "
-                f"arguments {self._all_signatures[sig]} times total during this task. "
-                f"This suggests you are not making progress. Try a different approach."
+                f"arguments {total_count} times total during this task. This suggests "
+                f"you are not making progress. Try a fundamentally different approach. "
+                f"If you reach {self.max_identical + 4} repeats this step will terminate.",
+                "warn",
             )
 
-        return None
+        return (None, "none")
 
     def reset(self):
         self._last_signature = ""
@@ -1060,23 +1095,30 @@ def run_agent_loop(
 
             # ── Cycle detection ──────────────────────────────────
             if tool_name != "task_done":
-                cycle_msg = cycle_detector.check(tool_name, tool_args)
+                cycle_msg, cycle_severity = cycle_detector.check(tool_name, tool_args)
                 if cycle_msg:
-                    rprint(f"  [yellow]{cycle_msg[:120]}[/yellow]")
+                    color = "red" if cycle_severity == "stop" else "yellow"
+                    rprint(f"  [{color}]{cycle_msg[:140]}[/{color}]")
                     logger.log("cycle_detected", {
                         "tool": tool_name, "iteration": iteration,
+                        "severity": cycle_severity,
                         "consecutive": cycle_detector._consecutive_count,
                     })
                     messages.append(ToolMessage(
                         content=cycle_msg,
                         tool_call_id=tool_id,
                     ))
-                    # Give agent one more chance, then force stop
-                    if cycle_detector._consecutive_count >= MAX_IDENTICAL_TOOL_CALLS + 1:
-                        rprint(f"  [red]Cycle not broken after warning — "
-                               f"force stopping {agent_name}[/red]")
-                        final_output = f"Agent {agent_name} terminated: stuck in cycle"
+                    if cycle_severity == "stop":
+                        rprint(f"  [red]Hard stop — terminating {agent_name} "
+                               f"to prevent runaway loop[/red]")
+                        final_output = (
+                            f"Agent {agent_name} terminated: stuck in cycle "
+                            f"on {tool_name}. Partial work may remain."
+                        )
                         done_this_round = True
+                        break
+                    # On "warn", break out of the inner tool loop so the agent
+                    # sees the warning and reconsiders on the next iteration.
                     break
 
             # Handle task_done — agent signals completion
@@ -1128,28 +1170,47 @@ def run_agent_loop(
 
                 # ── Build verification ────────────────────────────
                 # Skip for testing agent — it IS the build verifier
-                if BUILD_VERIFY_ENABLED and agent_name != "testing" and build_retries < BUILD_VERIFY_MAX_RETRIES:
+                # Skip build verify for doc-only agents (they don't write code)
+                _skip_build = agent_name in ("testing", "architect", "uiux", "reviewer")
+                if BUILD_VERIFY_ENABLED and not _skip_build and build_retries < BUILD_VERIFY_MAX_RETRIES:
                     build_cmds = _detect_build_commands()
                     if build_cmds:
                         rprint(f"  [dim]Running build check: {', '.join(build_cmds)}[/dim]")
                         build_ok, build_error = _run_build_check(build_cmds)
 
                         if not build_ok:
-                            build_retries += 1
-                            rprint(f"  [yellow]Build check FAILED "
-                                   f"(attempt {build_retries}/{BUILD_VERIFY_MAX_RETRIES})"
-                                   f" — re-entering loop[/yellow]")
-                            # Reset done state and feed error back to agent
-                            _last_done_result = {}
-                            messages.append(HumanMessage(
-                                content=(
-                                    f"BUILD VERIFICATION FAILED. Your code has errors. "
-                                    f"Fix them and call task_done again.\n\n"
-                                    f"{build_error}"
-                                )
-                            ))
-                            build_failed = True
-                            break  # Exit tool_calls loop, but NOT the ReAct loop
+                            # ── Scope check: only retry if the error is in
+                            # files THIS agent created/modified. Pre-existing
+                            # errors should NOT drag the agent into fix mode.
+                            error_in_my_files = False
+                            if files_changed:
+                                for f in files_changed:
+                                    # Normalize: strip leading ./ and project root
+                                    fname = f.replace("\\", "/").split("/")[-1]  # filename
+                                    fpath = f.replace("\\", "/")
+                                    if fname in build_error or fpath in build_error:
+                                        error_in_my_files = True
+                                        break
+
+                            if not error_in_my_files:
+                                rprint(f"  [dim]Build has pre-existing errors "
+                                       f"(not in this agent's files) — skipping retry[/dim]")
+                                # Don't retry — let the agent finish
+                            else:
+                                build_retries += 1
+                                rprint(f"  [yellow]Build check FAILED "
+                                       f"(attempt {build_retries}/{BUILD_VERIFY_MAX_RETRIES})"
+                                       f" — error in agent's own files, re-entering loop[/yellow]")
+                                _last_done_result = {}
+                                messages.append(HumanMessage(
+                                    content=(
+                                        f"BUILD VERIFICATION FAILED. There are errors in files YOU wrote. "
+                                        f"Fix ONLY your files and call task_done again.\n\n"
+                                        f"{build_error}"
+                                    )
+                                ))
+                                build_failed = True
+                                break  # Exit tool_calls loop, but NOT the ReAct loop
                         else:
                             rprint(f"  [green]Build check passed[/green]")
 

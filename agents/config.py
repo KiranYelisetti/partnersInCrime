@@ -131,10 +131,16 @@ def get_llm(role: str = "specialist"):
 
         ctx = NUM_CTX
 
+        # Disable reasoning/thinking mode for qwen3 models.
+        # Without this, qwen3 generates thousands of hidden CoT tokens
+        # before outputting JSON, causing 10+ minute hangs.
+        is_thinking_model = "qwen3" in model.lower()
+
         return ChatOllama(
             model=model,
             base_url=OLLAMA_BASE_URL,
             temperature=temperature,
             num_ctx=ctx,
             keep_alive=OLLAMA_KEEP_ALIVE,
+            reasoning=False if is_thinking_model else None,
         )
