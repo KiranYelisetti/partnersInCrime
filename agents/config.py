@@ -98,7 +98,7 @@ _ref_root = os.getenv("REFERENCE_PROJECT_ROOT", "")
 REFERENCE_PROJECT_ROOT = Path(_ref_root) if _ref_root else None
 
 # RAG retrieval limits — fewer chunks = fewer embedding calls = less VRAM pressure
-RAG_CODEBASE_K = int(os.getenv("RAG_CODEBASE_K", "2"))
+RAG_CODEBASE_K = int(os.getenv("RAG_CODEBASE_K", "0"))
 RAG_MISTAKES_K = int(os.getenv("RAG_MISTAKES_K", "2"))
 RAG_RESULTS_K = int(os.getenv("RAG_RESULTS_K", "2"))
 
